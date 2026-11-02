@@ -1,0 +1,497 @@
+import os
+import base64
+import json
+import logging
+from flask import Flask, request, jsonify, render_template_string
+from sarvamai import SarvamAI
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("HeritagePassport")
+
+# Load environment variables from .env
+env_path = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(env_path):
+    with open(env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, val = line.split("=", 1)
+                os.environ.setdefault(key.strip(), val.strip().strip("'\""))
+
+api_key = os.environ.get("SARVAM_API_KEY")
+client = SarvamAI(api_subscription_key=api_key) if api_key else None
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
+
+SAMPLE_ITEMS = [
+    {
+        "id": "taj_mahal",
+        "title": "Taj Mahal",
+        "subtitle": "Mughal Marble Wonder",
+        "url": "https://images.unsplash.com/photo-1564507592333-c60657eea523?w=800&q=80"
+    },
+    {
+        "id": "hampi",
+        "title": "Virupaksha Temple",
+        "subtitle": "Vijayanagara Granite Marvel",
+        "url": "https://images.unsplash.com/photo-1620766182966-c6eb5ed2b788?w=800&q=80"
+    },
+    {
+        "id": "amer_fort",
+        "title": "Amer Fort (Jaipur)",
+        "subtitle": "Rajput Sandstone Citadel",
+        "url": "https://images.unsplash.com/photo-1599661046289-e31897846e41?w=800&q=80"
+    },
+    {
+        "id": "temple_jewelry",
+        "title": "Royal Temple Jewelry",
+        "subtitle": "Kundan & Polki Gold Craft",
+        "url": "https://images.unsplash.com/photo-1535632066927-ab7c9ab60908?w=800&q=80"
+    }
+]
+
+ANALYSIS_SYSTEM_PROMPT = """
+You are the Chief Numismatist, Archaeologist, and Metallurgical Historian for the Archaeological Survey of India (ASI) issuing official Heritage Passports.
+Analyze the uploaded image of an Indian monument, architectural marvel, temple, sculpture, or traditional Indian ornament/jewelry.
+Extract accurate, deep historical and material information.
+
+Reply STRICTLY in valid JSON with no markdown wrapping and following this exact schema:
+{
+  "name": "Full official name of monument or ornament (in English)",
+  "vernacular_name": "Name in native Indic script (Devanagari, Tamil, Kannada, etc.)",
+  "category": "Monument / Architecture" OR "Ornament / Traditional Jewelry / Sacred Artifact",
+  "time_period": "Exact era and century (e.g., 13th Century CE (c. 1250 CE))",
+  "dynasty": "Ruling dynasty, patron, or historic artisan guild",
+  "materials": "Precise physical materials (e.g., Makrana white marble, Red sandstone, 22K Gold, Polki diamonds, Panchaloha bronze, Khondalite stone)",
+  "craft_style": "Specific architectural order or craft tradition (e.g., Kalinga Rekha Deula, Dravidian Gopuram, Mughal Pietra Dura, Kundan-Meenakari)",
+  "location": "City/Region, State, Republic of India",
+  "unesco_status": "UNESCO World Heritage Site (Year) OR National Heritage of India",
+  "durability_secret": "Clear scientific explanation of how it survived centuries of weathering, earthquakes, and time (e.g., mortar-free interlocking stones, rust-resistant metallurgical alloys, timber well foundations)",
+  "cultural_significance": "Engaging 2-3 sentence overview of its cultural, spiritual, and historical significance to India.",
+  "passport_stamp_code": "An official code like IND-AGR-TAJ-1648 or IND-KRN-VIR-1513",
+  "audio_script_en": "A clear, captivating 2-3 sentence museum tour narration script strictly in English.",
+  "audio_script_hi": "यह विवरण शुद्ध एवं सरल देवनागरी हिन्दी में लिखें (2-3 वाक्य), ताकि सारवम एआई की हिन्दी आवाज़ इसे सजीव रूप से सुना सके।"
+}
+"""
+
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Heritage Passport of India | Powered by Sarvam AI</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@600;700;800&family=Noto+Sans+Devanagari:wght@500;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-dark: #090f1d; --bg-card: #0f182c; --bg-subtle: #15223c;
+      --border-card: rgba(212, 175, 55, 0.28); --border-subtle: rgba(255, 255, 255, 0.1);
+      --gold-accent: #f59e0b; --gold-primary: #d4af37; --text-pure: #ffffff;
+      --text-body: #e2e8f0; --text-muted: #94a3b8; --paper-bg: #ffffff;
+      --paper-text: #0f172a; --paper-border: #e2e8f0;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg-dark); color: var(--text-body); font-family: 'Inter', sans-serif; font-size: 15px; line-height: 1.6; min-height: 100vh; }
+    .header { background: rgba(10, 16, 30, 0.95); border-bottom: 1px solid var(--border-card); padding: 16px 24px; position: sticky; top: 0; z-index: 100; backdrop-filter: blur(12px); }
+    .header-inner { max-width: 1200px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    .header-left { display: flex; align-items: center; gap: 14px; }
+    .emblem { width: 50px; height: 50px; border-radius: 12px; background: #1e293b; border: 1.5px solid var(--gold-primary); display: flex; align-items: center; justify-content: center; font-size: 24px; }
+    .sanskrit { color: var(--gold-accent); font-size: 11px; font-weight: 700; letter-spacing: 2px; }
+    h1 { font-family: 'Plus Jakarta Sans', sans-serif; font-size: 22px; font-weight: 800; color: #fff; }
+    .counter { background: var(--bg-card); border: 1px solid var(--border-card); border-radius: 10px; padding: 8px 16px; text-align: center; }
+    .count { font-size: 22px; font-weight: 800; color: var(--gold-accent); font-family: 'Share Tech Mono', monospace; }
+    .container { max-width: 1200px; margin: 30px auto; padding: 0 20px; display: flex; flex-direction: column; gap: 26px; }
+    .card { background: var(--bg-card); border: 1px solid var(--border-card); border-radius: 16px; padding: 26px; }
+    .dropzone { border: 2px dashed rgba(212, 175, 55, 0.4); background: rgba(15, 24, 44, 0.6); border-radius: 12px; padding: 36px 20px; text-align: center; cursor: pointer; position: relative; transition: all 0.2s; }
+    .dropzone:hover { border-color: var(--gold-accent); background: rgba(245, 158, 11, 0.05); }
+    .file-input { position: absolute; top: 0; left: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+    .presets-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin-top: 14px; }
+    .preset-btn { display: flex; align-items: center; gap: 12px; background: var(--bg-subtle); border: 1px solid var(--border-subtle); border-radius: 10px; padding: 10px 14px; cursor: pointer; color: #fff; text-align: left; transition: all 0.2s; }
+    .preset-btn:hover { border-color: var(--gold-accent); background: #1c2b4c; }
+    .preset-thumb { width: 44px; height: 44px; border-radius: 6px; object-fit: cover; }
+    .loading-box { display: none; background: var(--bg-card); border: 1px solid var(--border-card); border-radius: 14px; padding: 36px; text-align: center; }
+    .spinner { width: 48px; height: 48px; border: 3px solid rgba(245, 158, 11, 0.2); border-top-color: var(--gold-accent); border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 16px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .topbar { display: flex; justify-content: space-between; align-items: center; background: var(--bg-card); border: 1px solid var(--border-card); border-radius: 12px; padding: 12px 18px; margin-bottom: 20px; flex-wrap: wrap; gap: 10px; }
+    .passport { background: var(--paper-bg); color: var(--paper-text); border-radius: 16px; border: 2px solid var(--gold-primary); box-shadow: 0 20px 50px rgba(0,0,0,0.5); overflow: hidden; display: grid; grid-template-columns: 420px 1fr; }
+    .pass-left { background: #fbfbfa; border-right: 1px solid var(--paper-border); padding: 26px 22px; display: flex; flex-direction: column; gap: 18px; }
+    .pass-right { padding: 26px 30px; display: flex; flex-direction: column; gap: 16px; background: #fff; }
+    .identity-row { display: flex; gap: 14px; }
+    .photo-box { width: 135px; height: 170px; border-radius: 8px; border: 2px solid #cbd5e1; overflow: hidden; background: #e2e8f0; flex-shrink: 0; }
+    .photo-box img { width: 100%; height: 100%; object-fit: cover; }
+    .meta-list { display: flex; flex-direction: column; gap: 6px; }
+    .label { font-size: 10px; font-weight: 700; text-transform: uppercase; color: #64748b; }
+    .val-title { font-family: 'Plus Jakarta Sans', sans-serif; font-size: 17px; font-weight: 800; color: #991b1b; }
+    .val-vernacular { font-size: 15px; color: #1e40af; font-weight: 700; }
+    .val-meta { font-size: 13.5px; font-weight: 600; color: #0f172a; }
+    .stamp-box { display: flex; justify-content: center; }
+    .stamp { width: 180px; height: 180px; border: 3px dashed #dc2626; border-radius: 50%; color: #dc2626; display: flex; align-items: center; justify-content: center; transform: rotate(-6deg); animation: pop 0.4s ease; }
+    @keyframes pop { 0% { transform: scale(1.4) rotate(-20deg); } 100% { transform: scale(1) rotate(-6deg); } }
+    .stamp-core { width: 88%; height: 88%; border: 1.5px solid #dc2626; border-radius: 50%; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+    .mrz { background: #f1f5f9; border-top: 2px dashed #cbd5e1; padding: 10px 12px; border-radius: 6px; font-family: 'Share Tech Mono', monospace; font-size: 11px; letter-spacing: 1.8px; color: #1e293b; font-weight: 600; }
+    .info-card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 16px; }
+    .info-card.yellow { background: #fefce8; border-color: #fef08a; }
+    .info-card .tag { font-size: 11px; font-weight: 700; text-transform: uppercase; color: #475569; margin-bottom: 4px; }
+    .info-card .text { font-size: 14px; color: #1e293b; font-weight: 500; }
+    .audio-box { background: #0f172a; color: #fff; border-radius: 12px; padding: 18px; border: 1.5px solid var(--gold-accent); }
+    .audio-btns { display: flex; gap: 10px; margin: 12px 0; }
+    .btn-audio { flex: 1; padding: 12px; border-radius: 8px; font-size: 14px; font-weight: 700; cursor: pointer; border: none; color: #fff; transition: all 0.2s; }
+    .btn-en { background: #2563eb; } .btn-en:hover { background: #1d4ed8; }
+    .btn-hi { background: #d97706; } .btn-hi:hover { background: #b45309; }
+    .active-play { box-shadow: 0 0 14px rgba(245, 158, 11, 0.7); outline: 2px solid #fff; }
+    .transcript { background: rgba(255,255,255,0.08); border-radius: 8px; padding: 10px 14px; font-size: 13.5px; margin-top: 8px; }
+    .btn-bar { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; font-size: 13px; font-weight: 700; border-radius: 6px; border: none; cursor: pointer; }
+    .btn-gold { background: var(--gold-accent); color: #090f1d; }
+    .btn-ghost { background: rgba(255,255,255,0.1); color: #fff; }
+    @media (max-width: 900px) { .passport { grid-template-columns: 1fr; } .pass-left { border-right: none; border-bottom: 2px solid #e2e8f0; } .audio-btns { flex-direction: column; } }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <div class="header-inner">
+      <div class="header-left">
+        <div class="emblem">🏛️</div>
+        <div>
+          <div class="sanskrit">भारत गणराज्य • विरासत परमो धर्मः</div>
+          <h1>HERITAGE PASSPORT OF INDIA</h1>
+        </div>
+      </div>
+      <div class="counter"><span class="count" id="cNum">0</span><div style="font-size:10px;color:#94a3b8;font-weight:700;">VISAS</div></div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="card">
+      <h2 style="font-size:20px;margin-bottom:6px;color:#fff;">Upload Photo of Monument or Traditional Ornament</h2>
+      <p style="font-size:13px;color:#94a3b8;margin-bottom:20px;">Submit any Indian temple, fortress, cave sculpture, or traditional jewelry craft. Sarvam Multimodal Vision & Indic Reasoning will verify its era, materials, and architectural pedigree.</p>
+      
+      <div class="dropzone" id="dropzone">
+        <input type="file" id="fileIn" accept="image/*" class="file-input">
+        <div style="font-size:24px;margin-bottom:8px;">📷</div>
+        <div style="font-weight:600;color:#fff;">Click or drag & drop photograph here</div>
+      </div>
+
+      <div style="margin-top:20px;">
+        <div style="font-size:11px;font-weight:700;color:var(--gold-accent);letter-spacing:1px;text-transform:uppercase;">Or select a preset:</div>
+        <div class="presets-grid">
+          <button class="preset-btn" onclick="scanPreset('taj_mahal')">
+            <img src="https://images.unsplash.com/photo-1564507592333-c60657eea523?w=800&q=80" class="preset-thumb">
+            <div><strong>Taj Mahal</strong><div style="font-size:11px;color:#94a3b8;">Mughal Marble Wonder</div></div>
+          </button>
+          <button class="preset-btn" onclick="scanPreset('hampi')">
+            <img src="https://images.unsplash.com/photo-1620766182966-c6eb5ed2b788?w=800&q=80" class="preset-thumb">
+            <div><strong>Virupaksha Temple</strong><div style="font-size:11px;color:#94a3b8;">Vijayanagara Granite</div></div>
+          </button>
+          <button class="preset-btn" onclick="scanPreset('amer_fort')">
+            <img src="https://images.unsplash.com/photo-1599661046289-e31897846e41?w=800&q=80" class="preset-thumb">
+            <div><strong>Amer Fort (Jaipur)</strong><div style="font-size:11px;color:#94a3b8;">Rajput Sandstone Citadel</div></div>
+          </button>
+          <button class="preset-btn" onclick="scanPreset('temple_jewelry')">
+            <img src="https://images.unsplash.com/photo-1535632066927-ab7c9ab60908?w=800&q=80" class="preset-thumb">
+            <div><strong>Royal Temple Jewelry</strong><div style="font-size:11px;color:#94a3b8;">Kundan & Polki Gold</div></div>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <div class="loading-box" id="loader">
+      <div class="spinner"></div>
+      <h3 style="font-size:18px;color:#fff;margin-bottom:4px;">Analyzing with Sarvam AI...</h3>
+      <div style="font-size:13px;color:#94a3b8;">Scanning visual geometry and querying Sarvam Multimodal Intelligence...</div>
+    </div>
+
+    <section id="resultSection" style="display:none;">
+      <div class="topbar">
+        <span style="color:#10b981;font-weight:700;font-size:13px;">✔ OFFICIAL HERITAGE VISA ISSUED • ARCHAEOLOGICAL SURVEY OF INDIA & SARVAM AI</span>
+        <div>
+          <button class="btn-bar btn-ghost" onclick="window.print()">🖨️ Print Certificate</button>
+          <button class="btn-bar btn-gold" onclick="window.scrollTo({top:0,behavior:'smooth'})">🔄 Scan Another</button>
+        </div>
+      </div>
+
+      <div class="passport">
+        <div class="pass-left">
+          <div style="text-align:center;border-bottom:2px solid #e2e8f0;padding-bottom:10px;">
+            <div style="font-weight:800;font-size:14px;color:#0f172a;">REPUBLIC OF INDIA / भारत गणराज्य</div>
+            <div style="font-size:10px;font-weight:700;color:#64748b;">HERITAGE IMMIGRATION VISA</div>
+          </div>
+          <div class="identity-row">
+            <div class="photo-box"><img id="pPhoto" src=""></div>
+            <div class="meta-list">
+              <div><span class="label">Name:</span><div class="val-title" id="pName">—</div></div>
+              <div><span class="label">Vernacular:</span><div class="val-vernacular" id="pVernacular">—</div></div>
+              <div><span class="label">Period:</span><div class="val-meta" id="pEra" style="color:#b45309;">—</div></div>
+              <div><span class="label">Dynasty:</span><div class="val-meta" id="pDynasty">—</div></div>
+              <div><span class="label">Location:</span><div class="val-meta" id="pLocation">—</div></div>
+              <div><span class="label">Status:</span><div id="pUnesco" style="font-size:11px;font-weight:700;color:#92400e;background:#fef3c7;padding:2px 6px;border-radius:4px;width:fit-content;">—</div></div>
+            </div>
+          </div>
+          <div class="stamp-box">
+            <div class="stamp">
+              <div class="stamp-core">
+                <div style="font-size:8px;font-weight:800;">ARCHAEOLOGICAL SURVEY OF INDIA</div>
+                <div style="font-size:10px;font-weight:700;margin:2px 0;">विरासत परमो धर्मः</div>
+                <div id="pStampCode" style="font-family:'Share Tech Mono';font-size:12px;font-weight:800;border:1px solid #dc2626;padding:1px 6px;">IND-ASI-2026</div>
+                <div style="font-size:8.5px;font-weight:800;margin-top:2px;">PASSPORT VERIFIED</div>
+                <div id="pStampDate" style="font-size:9.5px;font-family:'Share Tech Mono';">02 NOV 2026</div>
+                <div style="font-size:7px;font-weight:700;">POWERED BY SARVAM AI</div>
+              </div>
+            </div>
+          </div>
+          <div class="mrz" id="pMrz">P&lt;INDHERITAGE&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;<br>IND20261102SARVAM&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;01</div>
+        </div>
+
+        <div class="pass-right">
+          <div style="border-bottom:2px solid #e2e8f0;padding-bottom:8px;">
+            <div style="font-weight:800;font-size:16px;">HISTORICAL DOSSIER & MATERIAL SCIENCE</div>
+            <div style="font-size:11px;font-weight:700;color:#64748b;">METALLURGY • CRAFTSMANSHIP • ARCHITECTURAL ORDERS</div>
+          </div>
+
+          <div class="info-card"><div class="tag">🔬 Material & Metallurgical Composition</div><div class="text" id="pMaterials">—</div></div>
+          <div class="info-card"><div class="tag">📐 Architectural & Artisan Craft Tradition</div><div class="text" id="pCraftStyle">—</div></div>
+          <div class="info-card yellow"><div class="tag">⚡ Centuries of Durability: Engineering Marvel</div><div class="text" id="pDurability">—</div></div>
+          <div class="info-card"><div class="tag">📜 Cultural & Civilizational Significance</div><div class="text" id="pSignificance">—</div></div>
+
+          <div class="audio-box">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <span style="font-size:12px;font-weight:700;color:var(--gold-accent);">🎙️ SARVAM BULBUL AUDIO TOUR GUIDE</span>
+              <span style="font-size:10px;color:#94a3b8;">High-Fidelity Indic Voices</span>
+            </div>
+            <div class="audio-btns">
+              <button class="btn-audio btn-en" id="btnEn" onclick="playAudio('en')">🔊 Listen in English (Aditya)</button>
+              <button class="btn-audio btn-hi" id="btnHi" onclick="playAudio('hi')">🔊 हिन्दी में सुनें (Anand)</button>
+            </div>
+            <div id="audioStatus" style="font-size:12px;color:#cbd5e1;">Select English or Hindi above to listen</div>
+            <div class="transcript" id="transcriptBox" style="display:none;"><strong id="tLabel" style="color:var(--gold-accent);"></strong> <span id="tText"></span></div>
+            <audio id="audioEl"></audio>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    let currentData = null;
+    let audioCache = {};
+    const audioEl = document.getElementById('audioEl');
+
+    document.getElementById('fileIn').addEventListener('change', (e) => {
+      if (e.target.files && e.target.files[0]) uploadFile(e.target.files[0]);
+    });
+
+    async function uploadFile(file) {
+      const fd = new FormData();
+      fd.append('image', file);
+      document.getElementById('loader').style.display = 'block';
+      try {
+        const res = await fetch('/api/analyze', { method: 'POST', body: fd });
+        const d = await res.json();
+        document.getElementById('loader').style.display = 'none';
+        if (d.success) render(d.data);
+        else alert('Error: ' + (d.error || 'Failed'));
+      } catch(e) { document.getElementById('loader').style.display = 'none'; alert(e.message); }
+    }
+
+    async function scanPreset(id) {
+      document.getElementById('loader').style.display = 'block';
+      try {
+        const res = await fetch('/api/analyze', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ sample_id: id })
+        });
+        const d = await res.json();
+        document.getElementById('loader').style.display = 'none';
+        if (d.success) render(d.data);
+        else alert('Error: ' + (d.error || 'Failed'));
+      } catch(e) { document.getElementById('loader').style.display = 'none'; alert(e.message); }
+    }
+
+    function render(data) {
+      currentData = data;
+      audioCache = {};
+      audioEl.pause();
+      document.getElementById('btnEn').classList.remove('active-play');
+      document.getElementById('btnHi').classList.remove('active-play');
+      document.getElementById('transcriptBox').style.display = 'none';
+      document.getElementById('audioStatus').textContent = 'Select English or Hindi above to listen';
+
+      document.getElementById('pPhoto').src = data.image_data_uri;
+      document.getElementById('pName').textContent = data.name || 'Heritage';
+      document.getElementById('pVernacular').textContent = data.vernacular_name || '—';
+      document.getElementById('pEra').textContent = data.time_period || 'Ancient';
+      document.getElementById('pDynasty').textContent = data.dynasty || '—';
+      document.getElementById('pLocation').textContent = data.location || 'India';
+      document.getElementById('pUnesco').textContent = data.unesco_status || 'National Heritage';
+      document.getElementById('pStampCode').textContent = data.passport_stamp_code || 'IND-ASI-2026';
+      document.getElementById('pStampDate').textContent = new Date().toLocaleDateString('en-GB', {day:'2-digit',month:'short',year:'numeric'}).toUpperCase();
+
+      const sanitized = (data.name || 'MONUMENT').toUpperCase().replace(/[^A-Z]/g, '<').slice(0, 24);
+      document.getElementById('pMrz').innerHTML = `P&lt;IND${sanitized}&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;<br>IND20261102SARVAM&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;01`;
+
+      document.getElementById('pMaterials').textContent = data.materials || '—';
+      document.getElementById('pCraftStyle').textContent = data.craft_style || '—';
+      document.getElementById('pDurability').textContent = data.durability_secret || '—';
+      document.getElementById('pSignificance').textContent = data.cultural_significance || '—';
+
+      document.getElementById('cNum').textContent = parseInt(document.getElementById('cNum').textContent || '0') + 1;
+      document.getElementById('resultSection').style.display = 'block';
+      document.getElementById('resultSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    async function playAudio(lang) {
+      if (!currentData) return;
+      const isHi = lang === 'hi';
+      const speaker = isHi ? 'anand' : 'aditya';
+      const langCode = isHi ? 'hi-IN' : 'en-IN';
+      const text = isHi ? (currentData.audio_script_hi || currentData.name) : (currentData.audio_script_en || currentData.name);
+
+      document.getElementById('transcriptBox').style.display = 'block';
+      document.getElementById('tLabel').textContent = isHi ? 'हिन्दी विवरण (Anand):' : 'English Narration (Aditya):';
+      document.getElementById('tText').textContent = text;
+      document.getElementById('btnEn').classList.toggle('active-play', !isHi);
+      document.getElementById('btnHi').classList.toggle('active-play', isHi);
+
+      if (audioCache[lang]) {
+        document.getElementById('audioStatus').textContent = `Playing ${isHi ? 'हिन्दी' : 'English'} with Sarvam Bulbul...`;
+        audioEl.src = audioCache[lang];
+        audioEl.play();
+        return;
+      }
+
+      document.getElementById('audioStatus').textContent = `Synthesizing ${isHi ? 'शुद्ध हिन्दी' : 'English'} with Sarvam Bulbul...`;
+      try {
+        const res = await fetch('/api/audio', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ text: text, language_code: langCode, speaker: speaker })
+        });
+        const d = await res.json();
+        if (d.success && d.audio_url) {
+          audioCache[lang] = d.audio_url;
+          audioEl.src = d.audio_url;
+          audioEl.play();
+          document.getElementById('audioStatus').textContent = `Playing ${isHi ? 'हिन्दी (Anand)' : 'English (Aditya)'} with Sarvam Bulbul...`;
+        }
+      } catch(e) { document.getElementById('audioStatus').textContent = 'Audio playback error.'; }
+    }
+
+    audioEl.onended = () => {
+      document.getElementById('btnEn').classList.remove('active-play');
+      document.getElementById('btnHi').classList.remove('active-play');
+      document.getElementById('audioStatus').textContent = 'Narration complete.';
+    };
+  </script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route("/api/samples")
+def get_samples():
+    return jsonify({"samples": SAMPLE_ITEMS})
+
+@app.route("/api/analyze", methods=["POST"])
+def analyze_heritage():
+    if not client:
+        return jsonify({"error": "SARVAM_API_KEY is not configured."}), 500
+
+    image_data_uri = None
+
+    if "image" in request.files:
+        file = request.files["image"]
+        if file.filename != "":
+            raw_bytes = file.read()
+            mime_type = file.mimetype or "image/jpeg"
+            b64_str = base64.b64encode(raw_bytes).decode("utf-8")
+            image_data_uri = f"data:{mime_type};base64,{b64_str}"
+
+    if not image_data_uri and request.is_json:
+        data = request.get_json()
+        if "sample_id" in data:
+            import urllib.request
+            sample = next((s for s in SAMPLE_ITEMS if s["id"] == data["sample_id"]), None)
+            if sample:
+                req = urllib.request.Request(sample["url"], headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req) as resp:
+                    raw_bytes = resp.read()
+                image_data_uri = f"data:image/jpeg;base64,{base64.b64encode(raw_bytes).decode('utf-8')}"
+        elif "image_data" in data:
+            image_data_uri = data["image_data"]
+
+    if not image_data_uri:
+        return jsonify({"error": "No image provided."}), 400
+
+    try:
+        user_content = [
+            {"type": "text", "text": "Analyze this Indian heritage structure or ornament and generate the official Heritage Passport JSON."},
+            {"type": "image_url", "image_url": {"url": image_data_uri}}
+        ]
+
+        response = client.chat.completions_v2(
+            model="gemma4",
+            messages=[
+                {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+            max_tokens=1200
+        )
+
+        content = response.choices[0].message.content
+        passport_data = json.loads(content)
+        passport_data["image_data_uri"] = image_data_uri
+        return jsonify({"success": True, "data": passport_data})
+
+    except Exception as e:
+        logger.error(f"Analysis error: {str(e)}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/audio", methods=["POST"])
+def generate_audio():
+    if not client:
+        return jsonify({"error": "Sarvam API client not initialized"}), 500
+
+    data = request.get_json() or {}
+    text = data.get("text", "").strip()
+    language_code = data.get("language_code", "hi-IN")
+    speaker = data.get("speaker", "anand" if language_code == "hi-IN" else "aditya")
+
+    if not text:
+        return jsonify({"error": "No text provided for audio narration"}), 400
+
+    text = text[:450].strip()
+
+    try:
+        res = client.text_to_speech.convert(
+            text=text,
+            language_code=language_code,
+            speaker=speaker,
+            model="bulbul:v3",
+            output_audio_codec="mp3"
+        )
+
+        if hasattr(res, "audios") and res.audios and len(res.audios[0]) > 0:
+            audio_b64 = res.audios[0]
+            return jsonify({
+                "success": True,
+                "language": language_code,
+                "speaker": speaker,
+                "audio_url": f"data:audio/mp3;base64,{audio_b64}"
+            })
+        else:
+            return jsonify({"error": "No audio returned by Sarvam TTS"}), 500
+
+    except Exception as e:
+        logger.error(f"TTS error: {str(e)}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="127.0.0.1", port=port, debug=False)
